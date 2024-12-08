@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify,send_from_directory
+from flask import Flask, request, jsonify,send_from_directory,make_response
 import MySQLdb
 from flask_mysqldb import MySQL
 import os
@@ -8,6 +8,10 @@ from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout
 import re
 import bcrypt
+import pandas as pd
+from io import BytesIO
+from fpdf import FPDF
+from datetime import datetime
 app = Flask(__name__)
 app.secret_key = 'xyzsdfg'
 
@@ -83,22 +87,34 @@ def upload_sample(uid, sample_type):
         return jsonify({'message': 'Error processing the image'}), 500
 
     try:
-        # Check if the patient already has a record in the 'count' table
-        cursor.execute('SELECT COUNT(*) FROM result WHERE uid = %s', (uid,))
-        record_exists1 = cursor.fetchone()['COUNT(*)']
-        if record_exists1 > 0:
-            cursor.execute(f'UPDATE count SET active_sperm{sample_type} = %s WHERE uid = %s',
-                           (active_count, uid))
-        else:
-            cursor.execute(f'INSERT INTO count (uid, active_sperm{sample_type}) VALUES (%s, %s)',
-                           (uid, active_count))
+        # Determine the column names for the sample and timestamp
+        active_sperm_column = f'active_sperm{sample_type}'
+        datetime_column = f'datetime{sample_type}'
 
-        # Check if there's already a record for the uid in the 'result' table
-        cursor.execute('SELECT COUNT(*) FROM result WHERE uid = %s', (uid,))
+        # Check if the patient already has a record in the 'count' table
+        cursor.execute('SELECT COUNT(*) FROM count WHERE uid = %s', (uid,))
         record_exists = cursor.fetchone()['COUNT(*)']
 
         if record_exists > 0:
-            # Update the existing record
+            # Update the existing record in the 'count' table
+            cursor.execute(f'''
+                UPDATE count
+                SET {active_sperm_column} = %s, {datetime_column} = NOW()
+                WHERE uid = %s
+            ''', (active_count, uid))
+        else:
+            # Insert a new record into the 'count' table
+            cursor.execute(f'''
+                INSERT INTO count (uid, {active_sperm_column}, {datetime_column})
+                VALUES (%s, %s, NOW())
+            ''', (uid, active_count))
+
+        # Check if there's already a record for the uid in the 'result' table
+        cursor.execute('SELECT COUNT(*) FROM result WHERE uid = %s', (uid,))
+        record_exists_result = cursor.fetchone()['COUNT(*)']
+
+        if record_exists_result > 0:
+            # Update the existing record in the 'result' table
             cursor.execute(f'UPDATE result SET sample{sample_type} = %s WHERE uid = %s',
                            (processed_filepath, uid))
         else:
@@ -108,11 +124,10 @@ def upload_sample(uid, sample_type):
 
         connection.commit()
     except Exception as e:
-        mysql.connection.rollback()
+        connection.rollback()
         return jsonify({'message': str(e)}), 500
     finally:
         cursor.close()
-        
 
     return jsonify({
         'message': 'Sample uploaded and processed successfully',
@@ -260,7 +275,7 @@ def recent_patients():
     connection = get_mysql_connection()
     cursor = connection.cursor()
     try:
-        cursor.execute('SELECT name, uid AS patient_id, age, occupation, height, weight, bmi, foc, sexual_dysfunction, alcoholic, smoker, drugs FROM patient ORDER BY uid desc')
+        cursor.execute('SELECT name, uid AS patient_id, age, occupation, height, weight, bmi, foc, sexual_dysfunction, alcoholic, smoker, drugs, date AS date FROM patient ORDER BY uid desc')
         patients = cursor.fetchall()
         return jsonify(patients), 200
     except Exception as e:
@@ -364,7 +379,7 @@ def get_uploaded_file(filename):
 @app.route('/view_result_page', methods=['GET'])
 def view_result():
     connection = get_mysql_connection()
-    cursor=connection.cursor()
+    cursor = connection.cursor()
     uid = request.args.get('uid')
     sample_type = request.args.get('sample_type')  # Expecting a sample number (1-6)
 
@@ -374,6 +389,7 @@ def view_result():
     # Validate sample type
     if sample_type not in ['1', '2', '3', '4', '5', '6']:
         return jsonify({'message': 'Invalid sample type'}), 400
+
     try:
         # Retrieve patient details
         cursor.execute('SELECT * FROM patient WHERE uid = %s', (uid,))
@@ -386,34 +402,47 @@ def view_result():
         cursor.execute('SELECT active_sperm{} FROM count WHERE uid = %s'.format(sample_type), (uid,))
         sperm_counts = cursor.fetchone()
 
+        # Retrieve datetime
+        cursor.execute('SELECT datetime{} FROM count WHERE uid = %s'.format(sample_type), (uid,))
+        datetime_row = cursor.fetchone()
+
         # Retrieve the processed image filepath
         cursor.execute('SELECT sample{} FROM result WHERE uid = %s'.format(sample_type), (uid,))
         processed_result = cursor.fetchone()
-        print(sperm_counts)
-        print(processed_result)
+
+        # Handle missing data
         if not sperm_counts or not processed_result:
             return jsonify({
-            'patient': patient,
-            'sperm_counts': {
-                'active_sperm': None
-            },
-            'processed_image': None
-        }), 404
+                'patient': patient,
+                'sperm_counts': {'active_sperm': None},
+                'Datetime': None,
+                'processed_image': None
+            }), 404
 
+        # Format data
         active_sperm = sperm_counts[f'active_sperm{sample_type}']
+        datetime_value = datetime_row[f'datetime{sample_type}'] if datetime_row else None
+        formatted_datetime = (
+            datetime_value.strftime('%Y-%m-%d %H:%M:%S') if datetime_value else None
+        )
         processed_image = processed_result[f'sample{sample_type}']
+
+        print(type(formatted_datetime))
+
         # Return the results in JSON format
         return jsonify({
             'patient': patient,
-            'sperm_counts': {
-                'active_sperm': active_sperm
-            },
+            'sperm_counts': {'active_sperm': active_sperm},
+            'Datetime': formatted_datetime,
             'processed_image': processed_image
         }), 200
+
     except Exception as e:
         return jsonify({'message': str(e)}), 500
+
     finally:
         cursor.close()
+
 @app.route('/get_profile_page', methods=['GET'])
 def get_profile():
     connection = get_mysql_connection()
@@ -576,6 +605,105 @@ def get_doctors():
     except Exception as e:
         print(e)
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/download_report/<int:uid>', methods=['GET'])
+def download_report(uid):
+    connection = get_mysql_connection()
+    cur = connection.cursor()
+    cur.execute("SELECT name, age, sexual_dysfunction, bmi FROM patient WHERE uid = %s", (uid,))
+    patient = cur.fetchone()
+
+    if not patient:
+        return jsonify({"error": "Patient not found"}), 404
+
+    name=patient['name']
+    age=patient['age']
+    dysfunction=patient['sexual_dysfunction']
+    bmi=patient['bmi']
+
+
+    # Fetch sperm count and date details
+    cur.execute("""
+        SELECT *
+        FROM count WHERE uid = %s
+    """, (uid,))
+    data = cur.fetchone()
+    cur.close()
+
+    if not data:
+        return jsonify({"error": "Sperm count details not found"}), 404
+
+    # Separate counts and dates
+    counts = [data.get(f'active_sperm{i+1}', 'NIL') for i in range(6)]
+    dates = [data.get(f'datetime{i+1}', 'NIL') for i in range(6)]
+    counts = ["NIL" if count is None else count for count in counts]
+    dates = [
+        "NIL" if date is None else datetime.strptime(str(date), '%Y-%m-%d %H:%M:%S').strftime('%d-%m-%Y %H:%M:%S')
+        if date != "NIL" else "NIL"
+        for date in dates
+    ]
+    # Generate PDF or Excel report
+    report_type= request.args.get('format')
+
+    if report_type == 'pdf':
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("Arial", size=12)
+
+        # Title
+        pdf.cell(200, 10, txt="Patient Report", ln=True, align='C')
+        pdf.ln(10)
+        # Patient details
+        pdf.cell(200, 10, txt=f"Name: {name}", ln=True)
+        pdf.cell(200, 10, txt=f"Age: {age}", ln=True)
+        pdf.cell(200, 10, txt=f"Sexual Dysfunction: {dysfunction}", ln=True)
+        pdf.cell(200, 10, txt=f"BMI: {bmi}", ln=True)
+        pdf.ln(10)
+
+        # Sperm count and dates
+        pdf.cell(200, 10, txt="Sperm Count and Dates:", ln=True)
+        for i, (count, date) in enumerate(zip(counts, dates), 1):
+            pdf.cell(200, 10, txt=f"Sample {i}: {count} (Date: {date})", ln=True)
+
+        # Save the PDF to a BytesIO object
+        pdf_buffer = BytesIO()
+        pdf.output(dest="S").encode("latin1")  # Get the content as bytes
+        pdf_buffer.write(pdf.output(dest='S').encode('latin1'))
+        pdf_buffer.seek(0)  # Reset the pointer to the beginning of the stream
+
+        # Return the PDF as a Flask response
+        response = make_response(pdf_buffer.read())
+        response.headers["Content-Type"] = "application/pdf"
+        response.headers["Content-Disposition"] = f"attachment; filename=patient_report_{uid}.pdf"
+
+        return response
+
+
+    elif report_type == 'csv':
+        # Prepare data for Excel
+        data = {
+    "Name": [name] + [''] * 5,  # Repeat only in the first row
+    "Age": [age] + [''] * 5,
+    "Dysfunction": [dysfunction] + [''] * 5,
+    "BMI": [bmi] + [''] * 5,
+    "Sample": [f"Sample {i+1}" for i in range(6)],
+    "Sperm Count": counts,
+    "Date": dates
+}
+        df = pd.DataFrame(data)
+
+        # Save to BytesIO for Excel
+        response = BytesIO()
+        df.to_csv(response, index=False)
+        response.seek(0)
+
+        return make_response(response.getvalue(), {
+            "Content-Type": "text/csv",
+            "Content-Disposition": f"attachment; filename=patient_report_{uid}.csv"
+        })
+
+    return jsonify({"error": "Invalid report type"}), 400
         
 if __name__ == '__main__':
     app.run(debug=True,host="0.0.0.0",port=8000)
